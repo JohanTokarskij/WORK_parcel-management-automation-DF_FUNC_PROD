@@ -27,12 +27,14 @@ from azure.keyvault.secrets import SecretClient
 
 # Durable-specific imports
 import azure.durable_functions as df
-from azure.durable_functions.models import RetryOptions
+from azure.durable_functions import DurableOrchestrationContext
+from azure.durable_functions import DurableOrchestrationClient
+from azure.durable_functions import RetryOptions
 
 # -------------------------------------------------------------------------
 # Initialize the FunctionApp and Key Vault client
 # -------------------------------------------------------------------------
-app = func.FunctionApp()
+app = df.DFApp()
 
 key_vault_url = "https://premo-vault.vault.azure.net/"
 credential = DefaultAzureCredential()
@@ -54,7 +56,7 @@ def should_run_script():
 # -------------------------------------------------------------------------
 # Activity: Send Email (same as original, just wrapped in an Activity)
 # -------------------------------------------------------------------------
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def send_email_with_excel_from_df(args: dict):
     """
     Activity to send an email with an optional Excel attachment derived from a Pandas DataFrame.
@@ -120,7 +122,7 @@ def send_email_with_excel_from_df(args: dict):
 # -------------------------------------------------------------------------
 # Activity: Create DI Session (same as original)
 # -------------------------------------------------------------------------
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def create_di_session(args: dict):
     DI_USERNAME = args['DI_USERNAME']
     DI_PASSWORD = args['DI_PASSWORD']
@@ -138,7 +140,7 @@ def create_di_session(args: dict):
 # -------------------------------------------------------------------------
 # Activities for Getting Areas, Groups, Parcel Data, etc.
 # -------------------------------------------------------------------------
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def get_all_areas_activity(args: dict):
     branch_emails = args['branch_emails']
     cookies = args['cookies']
@@ -164,7 +166,7 @@ def get_all_areas_activity(args: dict):
     logging.info("Successfully retrieved areas")
     return branch_areas_dict
 
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def get_product_groups_activity(args: dict):
     cookies = args['cookies']
     areas_str = args['areas_str']
@@ -185,7 +187,7 @@ def get_product_groups_activity(args: dict):
     else:
         raise Exception("Failed to retrieve product groups")
 
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def get_all_parcels_data_activity(args: dict):
     cookies = args['cookies']
     product_group_list = args['product_group_list']
@@ -220,7 +222,7 @@ def get_all_collected_parcels_data(all_parcels_data):
     not_collected = [p for p in all_parcels_data if p['status'] == 'RETURN_PARCEL_NOT_FOUND']
     return collected, not_collected
 
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def get_log_data_single_parcel_activity(args: dict):
     cookies = args['cookies']
     one_time_deliver_id = args['one_time_deliver_id']
@@ -270,7 +272,7 @@ def get_latest_carrier_events(parcel_data):
     parcel_data['logEvents'] = latest_carrier_events
     return parcel_data
 
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def get_early_bird_token_activity(args: dict):
     username = args['username']
     password = args['password']
@@ -285,7 +287,7 @@ def get_early_bird_token_activity(args: dict):
     else:
         raise Exception("Early Bird login failed")
 
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def fetch_morgonexpressen_parcels_activity(args: dict):
     """
     Fetches shipment data from Early Bird API with pagination.
@@ -341,7 +343,7 @@ def fetch_morgonexpressen_parcels_activity(args: dict):
 # -------------------------------------------------------------------------
 # Activity: Process Parcels (the big difference)
 # -------------------------------------------------------------------------
-@app.durable_activity_trigger(input_name="args")
+@app.activity_trigger(input_name="args")
 def process_parcels_activity(args: dict) -> list:
     """
     A single Activity that processes a list of parcels. We do the requests
@@ -472,7 +474,7 @@ def create_parcels_dataframe(parcels_list):
         '. Bud har ikke mottatt pakken': 'Ej mottagen',
         '. Pakken er skadet': 'Skadad',
         '. Mangler nøkkel': 'Saknar nyckel',
-        'Finner inte kundens leveringspunkt': 'Hittar inte kund',
+        'Finner ikke kundens leveringspunkt': 'Hittar inte kund',
         '. Uegnet leveringspunkt': 'Olämplig leveransplats',
         'RETURN_PARCEL_COLLECTED': 'Paket upphämtat'
     }
@@ -483,98 +485,112 @@ def create_parcels_dataframe(parcels_list):
 # -------------------------------------------------------------------------
 # Generator to fetch and categorize each parcel's log data
 # -------------------------------------------------------------------------
-def categorize_parcels_for_action(
-    session_cookies, not_delivered_parcel_data, morgonexpressen_parcels, context: df.OrchestrationContext
-):
+@app.activity_trigger(input_name="args")
+def categorize_parcels_for_action_activity(args: dict):
     """
-    Called by the orchestrator. Loops each not-delivered parcel and calls
-    get_log_data_single_parcel_activity in a sub-call for each.
+    Runs completely inside 1 activity worker – no Durable APIs here.
+    Inputs
+        cookies          : DI session cookies (dict[str, str])
+        not_delivered    : list[dict]  – raw parcel json objects
+        morgon_list      : set[str]    – barCodes that must be returned
+        delivery_tries   : int         – how many 'key missing / bad point'
+                                         attempts allowed before we return a parcel
+    Returns
+        (extend_list, return_list, lost_list)
+        where each item is [parcel, latest_carrier_event]
     """
-    from itertools import groupby
+    cookies_dict         = args["cookies"]
+    not_delivered_parcel_data   = args["not_delivered_parcel_data"]
+    morgonexpressen_parcels     = set(args["morgonexpressen_parcels"])
+    delivery_tries  = args.get("delivery_tries", 2)
 
     parcels_extend_list = []
     parcels_return_list = []
     parcels_lost_list = []
-    delivery_tries = 2  # threshold
+
+    # build a real session that can perform requests
+    sess = requests.Session()
+    sess.cookies.update(cookies_dict)
+
+    def fetch_log(one_time_deliver_id, area_id):
+        url     = f"https://app.di.no/control/api/v2/parcelDeviation/parcel/{one_time_deliver_id}"
+        r = sess.get(url, 
+                        headers={"content-type": "application/json","x-geography": area_id}, 
+                        timeout=30)
+        r.raise_for_status()
+        return r.json()
 
     for parcel in not_delivered_parcel_data:
         one_time_deliver_id = parcel['oneTimeDeliverId']
         area_id = f"area{str(parcel['area']['areaId'])}"
         tracking_number = str(parcel['trackingNumber'])
-
-        # Make a call to the activity that fetches the log data for the single parcel
-        args_dict = {
-            'cookies': session_cookies,
-            'one_time_deliver_id': one_time_deliver_id,
-            'area_id': area_id
-        }
-        log_data_single_parcel = context.call_activity("get_log_data_single_parcel_activity", args_dict)
-        yield log_data_single_parcel  # schedule it, collect results later
-
-    # Collect the results after all calls are scheduled
-    results = context.task_all([r for r in context.yield_activities()])
-    idx = 0
-    for parcel in not_delivered_parcel_data:
-        log_data_single_parcel = results[idx].result
-        idx += 1
-        if not log_data_single_parcel:
+        
+        log_data_single_parcel = fetch_log(one_time_deliver_id, area_id)
+        
+        if log_data_single_parcel is None:
             continue
 
-        updated = get_latest_carrier_events(log_data_single_parcel)
-        log_events = updated.get('logEvents', [])
-        if not log_events:
-            continue
+        log_data_filtered_last_ts = get_latest_carrier_events(log_data_single_parcel)
+        
+        if 'logEvents' in log_data_filtered_last_ts:
+            log_events = log_data_filtered_last_ts['logEvents']
 
-        log_events.sort(
-            key=lambda x: datetime.datetime.fromisoformat(x['dateTime']),
-            reverse=True
-        )
-        latest_event = log_events[0]
-        additional_desc = latest_event.get('additionalInfoDescription', '')
+            # Sort log events by dateTime in descending order to check the latest event
+            log_events.sort(key=lambda x: datetime.datetime.fromisoformat(x['dateTime']), reverse=True)
+            
+            # Condition for one delivery try for Morgonexpressen parcels
+            if tracking_number in morgonexpressen_parcels:
+                parcels_return_list.append([parcel, log_events[0]])
+                continue
 
-        # Condition for one delivery try for Morgonexpressen
-        if str(parcel['trackingNumber']) in morgonexpressen_parcels:
-            parcels_return_list.append([parcel, latest_event])
-            continue
+            # Condition for damaged parcels
+            if ". Pakken er skadet" in log_events[0].get('additionalInfoDescription', ''):
+                parcels_return_list.append([parcel, log_events[0]])
+                continue
+            
+            # Condition for lost parcels  
+            if ". Bud har ikke mottatt pakken" in log_events[0].get('additionalInfoDescription', ''):
+                parcels_lost_list.append([parcel, log_events[0]])
+                continue
+            
+            # Count occurrences of specific phrases in log events
+            count_mangler_nokkel = sum(
+                '. Mangler nøkkel' in event.get('additionalInfoDescription', '') for event in log_events
+            )
+            count_finner_ikke = sum(
+                'Finner ikke kundens leveringspunkt' in event.get('additionalInfoDescription', '') for event in log_events
+            )
+            count_uegnet_leveringspunkt= sum(
+                '. Uegnet leveringspunkt' in event.get('additionalInfoDescription', '') for event in log_events
+            )
+            
+            extend_condition = (
+                (count_mangler_nokkel + count_finner_ikke + count_uegnet_leveringspunkt) < delivery_tries and
+                count_mangler_nokkel < delivery_tries and
+                count_finner_ikke < delivery_tries and
+                count_uegnet_leveringspunkt < delivery_tries
+            )
 
-        # Damaged
-        if ". Pakken er skadet" in additional_desc:
-            parcels_return_list.append([parcel, latest_event])
-            continue
+            if extend_condition:
+                # Extend the parcel if the condition is met
+                parcels_extend_list.append([parcel, log_events[0]])
+            else:
+                # Return the parcel if the condition is not met
+                parcels_return_list.append([parcel, log_events[0]])
 
-        # Lost
-        if ". Bud har ikke mottatt pakken" in additional_desc:
-            parcels_lost_list.append([parcel, latest_event])
-            continue
-
-        # Count occurrences
-        count_mangler_nokkel = sum('. Mangler nøkkel' in e.get('additionalInfoDescription', '') for e in log_events)
-        count_finner_ikke = sum('Finner ikke kundens leveringspunkt' in e.get('additionalInfoDescription', '') for e in log_events)
-        count_uegnet_leveringspunkt = sum('. Uegnet leveringspunkt' in e.get('additionalInfoDescription', '') for e in log_events)
-
-        extend_condition = (
-            (count_mangler_nokkel + count_finner_ikke + count_uegnet_leveringspunkt) < delivery_tries
-            and count_mangler_nokkel < delivery_tries
-            and count_finner_ikke < delivery_tries
-            and count_uegnet_leveringspunkt < delivery_tries
-        )
-        if extend_condition:
-            parcels_extend_list.append([parcel, latest_event])
-        else:
-            parcels_return_list.append([parcel, latest_event])
-
+    logging.info("Successfully retrieved log data for last event")
     return parcels_extend_list, parcels_return_list, parcels_lost_list
 
 # -------------------------------------------------------------------------
 # Orchestrator Function with Try/Except
 # -------------------------------------------------------------------------
-@app.durable_orchestration_trigger(name="orchestrator_function")
-def orchestrator_function(context: df.OrchestrationContext):
+@app.orchestration_trigger(context_name="context")
+def orchestrator_function(context: df.DurableOrchestrationContext):
     try:
         # If we want to skip if outside time window
-        if not should_run_script():
-            logging.info("Not in the window to run the script. Exiting orchestration.")
-            return "Skipped"
+        # if not should_run_script():
+        #     logging.info("Not in the window to run the script. Exiting orchestration.")
+        #     return "Skipped"
 
         now = datetime.datetime.now(pytz.timezone('Europe/Stockholm'))
         today_date_iso = now.date().isoformat()
@@ -598,311 +614,150 @@ def orchestrator_function(context: df.OrchestrationContext):
             next_delivery_date += relativedelta(days=1)
             next_delivery_date_str = next_delivery_date.strftime('%Y-%m-%d')
 
-        # Create the DI session
-        cookies = context.call_activity(
-            "create_di_session",
-            {
-                'DI_USERNAME': DI_USERNAME,
-                'DI_PASSWORD': DI_PASSWORD
-            }
-        )
-
-        # Get all areas
-        branch_areas_dict = context.call_activity(
-            "get_all_areas_activity",
-            {
-                'branch_emails': BRANCH_EMAILS,
-                'cookies': cookies
-            }
-        )
-        areas_str = ','.join(branch_areas_dict.values())
-
-        # Get product groups
-        product_group_list = context.call_activity(
-            "get_product_groups_activity",
-            {
-                'cookies': cookies,
-                'areas_str': areas_str
-            }
-        )
-
-        # Get Early Bird token + Morgonexpressen parcels
-        token = context.call_activity(
-            "get_early_bird_token_activity",
-            {
-                'username': EARLY_BIRD_USERNAME,
-                'password': EARLY_BIRD_PASSWORD
-            }
-        )
-        morgon_list = context.call_activity(
-            "fetch_morgonexpressen_parcels_activity",
-            {
-                'token': token
-            }
-        )
-
-        # We'll store final automation results across all branches
+        retry_opts = RetryOptions(1, 3)
         automation_result_list = []
 
-        # We set up some RetryOptions for calling our process_parcels_activity
-        # e.g. max 3 attempts, no delay, etc.
-        retry_opts = RetryOptions(
-            first_retry_interval=datetime.timedelta(seconds=0),
-            max_attempts=3
-        )
+        # ── external I/O – each call MUST be yielded ────────────────────
+        cookies = yield context.call_activity("create_di_session", {
+            "DI_USERNAME": DI_USERNAME,
+            "DI_PASSWORD": DI_PASSWORD,
+        })
 
-        # For each branch, get data, categorize, process, and send email
+        branch_areas_dict = yield context.call_activity("get_all_areas_activity", {
+            "branch_emails": BRANCH_EMAILS,
+            "cookies": cookies,
+        })
+        areas_str = ",".join(branch_areas_dict.values())
+
+        product_group_list = yield context.call_activity("get_product_groups_activity", {
+            "cookies": cookies,
+            "areas_str": areas_str
+        })
+
+        token = yield context.call_activity("get_early_bird_token_activity", {
+            "username": EARLY_BIRD_USERNAME,
+            "password": EARLY_BIRD_PASSWORD,
+        })
+        morgonexpressen_parcels = yield context.call_activity("fetch_morgonexpressen_parcels_activity", {
+            "token": token,
+        })
+
+        # ── per-branch processing loop ──────────────────────────────────
         for branch_name, area_id in branch_areas_dict.items():
-            # (A) get parcels
-            all_parcels_data = context.call_activity(
-                "get_all_parcels_data_activity",
+
+            all_parcels_data = yield context.call_activity("get_all_parcels_data_activity", {
+                "cookies": cookies,
+                "product_group_list": product_group_list,
+                "areas_str": "area39799", #area_id
+            })
+
+            not_delivered_parcel_data = get_not_delivered_parcels(all_parcels_data)
+            collected, _  = get_all_collected_parcels_data(all_parcels_data)
+
+            (extend_list,
+            return_list,
+            lost_list) = yield context.call_activity(
+                "categorize_parcels_for_action_activity",
                 {
-                    'cookies': cookies,
-                    'product_group_list': product_group_list,
-                    'areas_str': area_id
+                    "cookies":       cookies,
+                    "not_delivered_parcel_data": not_delivered_parcel_data,
+                    "morgonexpressen_parcels":   morgonexpressen_parcels,
+                    "delivery_tries": 2,
+                },
+            )
+
+            # -- dispatch follow-up actions in four categories --
+            for desc, parcel_list, url, extra in [
+                ("Ny visning",  extend_list,   "https://app.di.no/control/api/v2/parcelDeviation/newDelivery",
+                                          {"next_delivery_date_str": next_delivery_date_str}),
+                ("Retur",       return_list,   "https://app.di.no/control/api/v2/parcelDeviation/returned",   None),
+                ("Förlorat",    lost_list,     "https://app.di.no/control/api/v2/parcelDeviation/lost",       None),
+                ("Upphämtning", collected,     "https://app.di.no/control/api/v2/parcelDeviation/collected",  None),
+            ]:
+                if not parcel_list:
+                    continue
+
+                payload = {
+                    "cookies": cookies,
+                    "parcels": [p[0] if isinstance(p, list) else p for p in parcel_list],
+                    "event_type_description": desc,
+                    "post_url": url,
                 }
-            )
-            # (B) local filtering
-            not_delivered_parcels = get_not_delivered_parcels(all_parcels_data)
-            collected_parcels_list, not_collected_parcels_list = get_all_collected_parcels_data(all_parcels_data)
+                if extra:
+                    payload.update(extra)
 
-            # (C) categorize
-            cat_result = yield from categorize_parcels_for_action(
-                cookies, not_delivered_parcels, morgon_list, context
-            )
-            parcels_extend_list, parcels_return_list, parcels_lost_list = cat_result
-
-            # (D) Now we orchestrate calls to the new process_parcels_activity with retry
-            # 1) "Ny visning"
-            if parcels_extend_list:
-                result_extend = context.call_activity_with_retry(
-                    "process_parcels_activity",
-                    retry_opts,
-                    {
-                        "cookies": cookies,
-                        "parcels": [p[0] for p in parcels_extend_list],
-                        "event_type_description": "Ny visning",
-                        "post_url": "https://app.di.no/control/api/v2/parcelDeviation/newDelivery",
-                        "next_delivery_date_str": next_delivery_date_str
-                    }
+                result = yield context.call_activity_with_retry(
+                    "process_parcels_activity", retry_opts, payload
                 )
-                yield result_extend  # schedule
-            else:
-                result_extend = None
+                automation_result_list.extend(result)
 
-            # 2) "Retur"
-            if parcels_return_list:
-                result_return = context.call_activity_with_retry(
-                    "process_parcels_activity",
-                    retry_opts,
-                    {
-                        "cookies": cookies,
-                        "parcels": [p[0] for p in parcels_return_list],
-                        "event_type_description": "Retur",
-                        "post_url": "https://app.di.no/control/api/v2/parcelDeviation/returned",
-                    }
-                )
-                yield result_return
-            else:
-                result_return = None
-
-            # 3) "Förlorat"
-            if parcels_lost_list:
-                result_lost = context.call_activity_with_retry(
-                    "process_parcels_activity",
-                    retry_opts,
-                    {
-                        "cookies": cookies,
-                        "parcels": [p[0] for p in parcels_lost_list],
-                        "event_type_description": "Förlorat",
-                        "post_url": "https://app.di.no/control/api/v2/parcelDeviation/lost",
-                    }
-                )
-                yield result_lost
-            else:
-                result_lost = None
-
-            # 4) "Upphämtning" (collected)
-            if collected_parcels_list:
-                result_collected = context.call_activity_with_retry(
-                    "process_parcels_activity",
-                    retry_opts,
-                    {
-                        "cookies": cookies,
-                        "parcels": collected_parcels_list,  # already dict
-                        "event_type_description": "Upphämtning",
-                        "post_url": "https://app.di.no/control/api/v2/parcelDeviation/collected"
-                    }
-                )
-                yield result_collected
-            else:
-                result_collected = None
-
-            # Now gather results from above steps
-            final_results = context.task_all([
-                r for r in context.yield_activities()
-                if r.result is not None
-            ])
-            all_step_results = yield final_results
-
-            for act_result in all_step_results:
-                # 'act_result.result' is a list of dicts from process_parcels_activity
-                if isinstance(act_result.result, list):
-                    automation_result_list.extend(act_result.result)
-
-            # (E) build and send email for the branch
-            df_extend = create_parcels_dataframe(parcels_extend_list)
-            df_return = create_parcels_dataframe(parcels_return_list)
-            df_lost = create_parcels_dataframe(parcels_lost_list)
-            df_collected = create_parcels_dataframe(collected_parcels_list)
+            # -- branch-level status e-mail --
+            summary_tables = {
+                "Ny visning":  create_parcels_dataframe(extend_list),
+                "Retur":       create_parcels_dataframe(return_list),
+                "Förlorat":    create_parcels_dataframe(lost_list),
+                "Upphämtning": create_parcels_dataframe(collected),
+            }
 
             email_to = BRANCH_EMAILS.get(branch_name)
             if email_to:
-                html_extend = (
-                    df_extend.to_html(index=False)
-                    if not df_extend.empty
-                    else "<p>Inga paket för 'ny visning'.</p>"
+                html_sections = "".join(
+                    f"<p><b>{title}</b>:</p>{df.to_html(index=False) if not df.empty else '<p>Inga paket.</p>'}"
+                    for title, df in summary_tables.items()
                 )
-                html_return = (
-                    df_return.to_html(index=False)
-                    if not df_return.empty
-                    else "<p>Inga paket för retur.</p>"
-                )
-                html_lost = (
-                    df_lost.to_html(index=False)
-                    if not df_lost.empty
-                    else "<p>Inga förlorade paket.</p>"
-                )
-                html_collected = (
-                    df_collected.to_html(index=False)
-                    if not df_collected.empty
-                    else "<p>Inga upphämtade paket.</p>"
-                )
+                yield context.call_activity("send_email_with_excel_from_df", {
+                    "sender_email":   SENDER_EMAIL,
+                    "sender_password":SENDER_PASSWORD,
+                    "to_emails":      email_to,
+                    "cc_emails":      _TO_EMAILS_DEV,
+                    "subject":        f"{branch_name}: Paketstatusrapport {today_date_iso}",
+                    "body":           f"<html><body><h3>Paketstatusrapport för {branch_name}</h3>{html_sections}</body></html>",
+                })
 
-                email_subject = f"{branch_name}: Paketstatusrapport {today_date_iso}"
-                email_html_content = f"""
-                <html>
-                <head>
-                    <style>
-                        table {{
-                            border-collapse: collapse;
-                            width: 70%;
-                            font-size: 12px;
-                        }}
-                        th, td {{
-                            border: 1px solid #ccc;
-                            padding: 5px;
-                            text-align: left;
-                        }}
-                        th {{
-                            background-color: #f2f2f2;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <h3>Paketstatusrapport för {branch_name}</h3>
-                    <p><b>Ny visning</b> (andra leveransförsöket):</p>
-                    {html_extend}
-                    <br>
-                    <p><b>Återgå till avsändare</b> (retur till Akalla):</p>
-                    {html_return}
-                    <br>
-                    <p><b>Försvunnet/stulet</b> under utdelning:</p>
-                    {html_lost}
-                    <br>
-                    <h4><b>Upphämtade paket</b>:</h4>
-                    {html_collected}
-                    <br>
-                    <p>Med vänliga hälsningar<br>
-                    Johan Tokarskij</p>
-                </body>
-                </html>
-                """
+        # ── consolidated debug report ───────────────────────────────────
+        df_automation = pd.DataFrame(automation_result_list).sort_values(by="route_name")
+        yield context.call_activity("send_email_with_excel_from_df", {
+            "sender_email":   SENDER_EMAIL,
+            "sender_password":SENDER_PASSWORD,
+            "to_emails":      _TO_EMAILS_DEV,
+            "cc_emails":      _TO_EMAILS_DEV,
+            "subject":        f"parcel-management-automation {today_date_iso}",
+            "body": (
+                f"<p><b>** DEBUG **</b></p>"
+                f"<p><b>Antal hanterade paket</b>: {len(df_automation)}</p>"
+                f"<p><b>Antal OK</b>:  {len(df_automation[df_automation['Status']=='OK'])}</p>"
+                f"<p><b>Antal fel</b>: {len(df_automation[df_automation['Status']=='rejected'])}</p>"
+            ),
+            "dataframe":       df_automation.to_dict(orient="records"),   # JSON-safe
+            "excel_filename": f"parcel-management-automation {today_date_iso}.xlsx",
+        })
 
-                context.call_activity(
-                    "send_email_with_excel_from_df",
-                    {
-                        'sender_email': SENDER_EMAIL,
-                        'sender_password': SENDER_PASSWORD,
-                        'to_emails': email_to,
-                        'cc_emails': _TO_EMAILS_DEV,
-                        'subject': email_subject,
-                        'body': email_html_content
-                    }
-                )
-
-        # 9) Send debug mail with the overall results
-        df_automation_result = pd.DataFrame(
-            automation_result_list,
-            columns=['branch_name','route_name','tracking_number','event_type_description','Status']
-        ).sort_values(by='route_name')
-
-        debug_mail_body = f"""
-        <p><b>** DEBUG **</b></p>
-        <p><b>Antal hanterade paket</b>: {len(df_automation_result)}</p>
-        <p><b>Antal OK</b>: {len(df_automation_result[df_automation_result['Status'] == 'OK'])}</p>
-        <p><b>Antal fel</b>: {len(df_automation_result[df_automation_result['Status'] == 'rejected'])}</p>
-        """
-
-        context.call_activity(
-            "send_email_with_excel_from_df",
-            {
-                'sender_email': SENDER_EMAIL,
-                'sender_password': SENDER_PASSWORD,
-                'to_emails': _TO_EMAILS_DEV,
-                'cc_emails': _TO_EMAILS_DEV,
-                'subject': f"parcel-management-automation {today_date_iso}",
-                'body': debug_mail_body,
-                'dataframe': df_automation_result,
-                'excel_filename': f"parcel-management-automation {today_date_iso}.xlsx"
-            }
-        )
-
-        # Wait for those final emails
-        yield context.task_all([r for r in context.yield_activities()])
-
-        logging.info('Python orchestrator function executed.')
         return "Done"
 
-    except Exception as e:
-        # If ANY unhandled exception occurs, we can send a dev email
-        logging.exception(f"An error occurred in the orchestrator: {e}")
-        # Compose the error email:
-        dev_email_body = f"""
-        <p><b>** Orchestrator Failed **</b></p>
-        <p>Error: {str(e)}</p>
-        <p>Please investigate the logs.</p>
-        """
-        # Schedule an activity to notify dev
-        context.call_activity(
-            "send_email_with_excel_from_df",
-            {
-                'sender_email': SENDER_EMAIL,
-                'sender_password': SENDER_PASSWORD,
-                'to_emails': _TO_EMAILS_DEV,
-                'cc_emails': _TO_EMAILS_DEV,
-                'subject': f"[FAIL] parcel-management-automation failed {today_date_iso}",
-                'body': dev_email_body
-            }
-        )
-
-        # Wait for that email to send
-        yield context.task_all([r for r in context.yield_activities()])
-
-        # Optionally re-raise so the orchestration is marked as failed
+    except Exception as exc:
+        # single best-effort alert; no retry logic in failure path
+        yield context.call_activity("send_email_with_excel_from_df", {
+            "sender_email":   SENDER_EMAIL,
+            "sender_password":SENDER_PASSWORD,
+            "to_emails":      _TO_EMAILS_DEV,
+            "cc_emails":      _TO_EMAILS_DEV,
+            "subject":        f"[FAIL] parcel-management-automation failed {today_date_iso}",
+            "body":           f"<p>{exc}</p>",
+        })
         raise
 
 
 # -------------------------------------------------------------------------
 # Timer Trigger That Starts the Orchestration
 # -------------------------------------------------------------------------
+@app.durable_client_input(client_name="starter")  
 @app.timer_trigger(
     schedule="0 0 10,11 * * *",
     arg_name="myTimer",
-    run_on_startup=False,
+    run_on_startup=True,
     use_monitor=True
 )
-def timer_trigger(myTimer: func.TimerRequest, starter: df.DurableOrchestrationClient) -> None:
+async def timer_trigger(myTimer: func.TimerRequest, starter: df.DurableOrchestrationClient) -> None:
     """
     Timer Trigger that starts the Orchestrator. The code inside the orchestrator
     is broken into smaller activity calls, preventing silent shutdown from
@@ -912,5 +767,5 @@ def timer_trigger(myTimer: func.TimerRequest, starter: df.DurableOrchestrationCl
         logging.info('The timer is past due!')
 
     # Just start the orchestrator. The orchestrator will handle the logic.
-    instance_id = starter.start_new("orchestrator_function", None)
+    instance_id = await starter.start_new("orchestrator_function", None)
     logging.info(f"Started orchestration with ID = '{instance_id}'")
